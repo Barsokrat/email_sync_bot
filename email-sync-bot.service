@@ -1,0 +1,16 @@
+[Unit]
+Description=Email Sync Bot
+After=network.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/email_sync_bot
+ExecStart=/home/ec2-user/email_sync_bot/venv/bin/python main.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/ec2-user/email_sync_bot/bot.log
+StandardError=append:/home/ec2-user/email_sync_bot/bot.log
+
+[Install]
+WantedBy=multi-user.target

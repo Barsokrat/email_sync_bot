@@ -1,0 +1,1 @@
+ssh -i /Users/victorboro/Projects/_keys_ssh_api/AWS_Key_pair_1.pem ec2-user@18.191.43.123

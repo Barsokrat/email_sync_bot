@@ -1,0 +1,3 @@
+aiohttp==3.8.6
+python-dotenv==1.0.0flask==3.0.0
+gunicorn==21.2.0

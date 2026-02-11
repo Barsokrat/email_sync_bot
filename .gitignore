@@ -1,0 +1,8 @@
+*.log
+.env
+__pycache__/
+venv/
+*.pyc
+*.db
+*.pem
+sent_message_ids.txt
