@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from logging.handlers import RotatingFileHandler
 from typing import List, Dict
 from datetime import datetime
 import os
@@ -12,9 +13,22 @@ from database import EmailDatabase
 
 load_dotenv()
 
+# Настройка ротации логов: макс 10MB на файл, хранить 5 резервных копий
+log_handler = RotatingFileHandler(
+    'bot.log',
+    maxBytes=10*1024*1024,  # 10MB
+    backupCount=5,
+    encoding='utf-8'
+)
+log_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+
+# Консольный вывод
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    handlers=[log_handler, console_handler]
 )
 logger = logging.getLogger(__name__)
 
