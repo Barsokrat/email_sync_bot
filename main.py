@@ -43,8 +43,8 @@ class EmailSyncBot:
         self.start_time = None
         self.emails_processed = 0
         self.last_update_offset = 0
-        self.sent_ids_file = 'sent_message_ids.txt'
-        self.sent_message_ids = self._load_sent_ids()  # Загружаем из файла
+        # Дедупликация отправленных писем ведётся персистентно в SQLite
+        # (таблица sent_emails), см. database.is_email_sent / mark_email_sent.
 
     async def start(self):
         logger.info("Запускаю Email Sync Bot...")
@@ -61,18 +61,26 @@ class EmailSyncBot:
         )
 
     async def email_check_loop(self):
-        """Цикл проверки новых писем"""
+        """Цикл проверки новых писем.
+
+        Держим ОДНО постоянное IMAP-соединение (открыто в start()). Обновление
+        списка писем делает NOOP внутри get_new_emails, а переподключение
+        происходит только при ошибке. Раньше здесь был disconnect()+connect()
+        на каждой итерации — из-за "битых" закрытий соединения накапливались
+        на Gmail до "Too many simultaneous connections", и бот слеп к почте.
+        """
         while self.is_running:
             try:
-                # Переподключаемся каждую проверку (каждые 30 сек) чтобы видеть новые письма сразу
-                logger.info("Переподключение к IMAP для обновления списка писем...")
-                await self.email_client.disconnect()
-                await self.email_client.connect()
-
                 await self.check_new_emails()
                 await asyncio.sleep(self.config.check_interval)
             except Exception as e:
                 logger.error(f"Ошибка при проверке почты: {e}")
+                # При сбое пересоздаём соединение перед следующей попыткой
+                try:
+                    await self.email_client.disconnect()
+                    await self.email_client.connect()
+                except Exception as reconnect_error:
+                    logger.error(f"Не удалось переподключиться: {reconnect_error}")
                 await asyncio.sleep(60)
 
     async def command_handler_loop(self):
@@ -227,39 +235,21 @@ class EmailSyncBot:
 
         await self.telegram_bot.send_message(chat_id, help_text)
 
-    def _load_sent_ids(self) -> set:
-        """Загружает ID отправленных писем из файла"""
-        try:
-            if os.path.exists(self.sent_ids_file):
-                with open(self.sent_ids_file, 'r') as f:
-                    ids = set(line.strip() for line in f if line.strip())
-                logger.info(f"Загружено {len(ids)} ID отправленных писем")
-                return ids
-        except Exception as e:
-            logger.error(f"Ошибка загрузки sent_ids: {e}")
-        return set()
-
-    def _save_sent_ids(self):
-        """Сохраняет ID отправленных писем в файл"""
-        try:
-            # Сохраняем только последние 1000
-            ids_to_save = list(self.sent_message_ids)[-1000:]
-            with open(self.sent_ids_file, 'w') as f:
-                f.write('\n'.join(ids_to_save))
-        except Exception as e:
-            logger.error(f"Ошибка сохранения sent_ids: {e}")
-
     async def check_new_emails(self):
         try:
-            all_emails = await self.email_client.get_new_emails(since=self.last_check)
+            # Дедуп идёт через SQLite по Message-ID — персистентно, без лимита
+            # и переживает перезапуск бота (раньше был deque(maxlen=1000),
+            # который "забывал" старые ID при большом суточном объёме писем
+            # и рассылал одни и те же регистрации повторно).
+            # is_sent передаём в get_new_emails, чтобы отсеять уже отправленные
+            # письма ДО тяжёлого RFC822-фетча (сотни писем/день × каждые 30 сек).
+            all_emails = await self.email_client.get_new_emails(
+                since=self.last_check,
+                is_sent=lambda mid: self.database.is_email_sent({'message_id': mid}),
+            )
 
-            # Фильтруем только те, которые ещё не отправляли
-            new_emails = []
-            for email in all_emails:
-                msg_id = email.get('message_id')
-                if msg_id and msg_id not in self.sent_message_ids:
-                    new_emails.append(email)
-                    self.sent_message_ids.add(msg_id)
+            # Перепроверяем на всякий случай (письма без Message-ID и т.п.)
+            new_emails = [e for e in all_emails if not self.database.is_email_sent(e)]
 
             # Отправляем только новые всем пользователям
             active_users = self.database.get_active_users()
@@ -275,19 +265,15 @@ class EmailSyncBot:
                     except Exception as e:
                         logger.error(f"Ошибка отправки пользователю {chat_id}: {e}")
 
+                # ТОЛЬКО ПОСЛЕ отправки помечаем письмо как отправленное в БД
+                self.database.mark_email_sent(email)
+
                 logger.info(f"Отправлено уведомление о письме от {email['sender']} для {sent_count} пользователей")
                 self.emails_processed += 1
 
             if new_emails:
                 self.last_check = datetime.now()
                 logger.info(f"Обработано {len(new_emails)} новых писем из {len(all_emails)}")
-                # Сохраняем после каждой обработки
-                self._save_sent_ids()
-
-            # Ограничиваем размер set (храним только последние 1000)
-            if len(self.sent_message_ids) > 1000:
-                self.sent_message_ids = set(list(self.sent_message_ids)[-1000:])
-                self._save_sent_ids()
 
         except Exception as e:
             logger.error(f"Ошибка при получении писем: {e}")

@@ -6,3 +6,7 @@ venv/
 *.db
 *.pem
 sent_message_ids.txt
+
+.DS_Store
+openai_key.txt
+Claude_start_prompt.txt

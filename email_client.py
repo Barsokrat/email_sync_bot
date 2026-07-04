@@ -48,16 +48,25 @@ class EmailClient:
             raise
 
     async def disconnect(self):
-        if self.imap and self.is_connected:
+        if self.imap:
+            loop = asyncio.get_event_loop()
             try:
-                loop = asyncio.get_event_loop()
                 await loop.run_in_executor(None, self.imap.logout)
-                self.is_connected = False
                 logger.info("Отключение от почтового сервера")
             except Exception as e:
                 logger.error(f"Ошибка при отключении: {e}")
+                # Принудительно закрываем сокет: иначе "битое" соединение
+                # (напр. SSL BAD_LENGTH) остаётся висеть на стороне Gmail и
+                # накапливается до "Too many simultaneous connections".
+                try:
+                    await loop.run_in_executor(None, self.imap.shutdown)
+                except Exception:
+                    pass
+            finally:
+                self.is_connected = False
+                self.imap = None
 
-    async def get_new_emails(self, since: Optional[datetime] = None) -> List[Dict]:
+    async def get_new_emails(self, since: Optional[datetime] = None, is_sent=None) -> List[Dict]:
         if not self.is_connected:
             logger.error("Нет подключения к почтовому серверу")
             return []
@@ -75,6 +84,17 @@ class EmailClient:
                 from datetime import datetime
                 today_str = datetime.now().strftime("%d-%b-%Y")
                 search_criteria = f'(SINCE "{today_str}")'
+
+            # Обновляем состояние ящика без переподключения: NOOP заставляет
+            # сервер прислать актуальные данные (новые письма видны сразу).
+            # Так мы держим ОДНО постоянное соединение вместо переподключения
+            # каждые 30 сек, которое накапливало висящие соединения на Gmail.
+            try:
+                await loop.run_in_executor(None, self.imap.noop)
+            except (imaplib.IMAP4.abort, imaplib.IMAP4.error, OSError) as e:
+                logger.warning(f"IMAP соединение потеряно (noop): {e}. Переподключаюсь...")
+                await self.disconnect()
+                await self.connect()
 
             # Поиск писем с автоматическим переподключением
             try:
@@ -107,13 +127,23 @@ class EmailClient:
                 message_ids = message_ids[-self.config.max_emails_per_batch:]
                 logger.info(f"Первый запуск: берём последние {len(message_ids)} писем")
 
+            # Дедуп ДО тяжёлого фетча: батчем получаем только заголовок Message-ID
+            # (лёгкий) и через колбэк is_sent отсеиваем уже отправленные письма.
+            # Полный RFC822 тянем ТОЛЬКО для новых — иначе фетч сотен писем за день
+            # каждые 30 сек рвал соединение (Broken pipe / System Error).
+            to_fetch = message_ids
+            if is_sent is not None and message_ids:
+                id_map = await self._fetch_message_ids(message_ids)
+                to_fetch = [seq for seq in message_ids
+                            if not (id_map.get(seq) and is_sent(id_map[seq]))]
+
             emails = []
-            for msg_id in message_ids:
+            for msg_id in to_fetch:
                 email_data = await self._fetch_email(msg_id)
                 if email_data:
                     emails.append(email_data)
 
-            logger.info(f"Найдено {len(emails)} писем")
+            logger.info(f"Найдено {len(message_ids)} писем за период, новых к отправке: {len(emails)}")
             return emails
 
         except Exception as e:
@@ -126,6 +156,38 @@ class EmailClient:
             except Exception as reconnect_error:
                 logger.error(f"Не удалось переподключиться: {reconnect_error}")
             return []
+
+    async def _fetch_message_ids(self, seq_ids: list) -> dict:
+        """Батч-фетч ТОЛЬКО заголовка Message-ID (без тела письма).
+
+        Возвращает {seq(bytes): message_id(str)}. Используется для дедупликации
+        до тяжёлого RFC822-фетча. BODY.PEEK не выставляет флаг \\Seen.
+        """
+        loop = asyncio.get_event_loop()
+        result = {}
+        CH = 100
+        for i in range(0, len(seq_ids), CH):
+            chunk = seq_ids[i:i + CH]
+            try:
+                typ, data = await loop.run_in_executor(
+                    None,
+                    self.imap.fetch,
+                    b','.join(chunk),
+                    '(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])'
+                )
+            except (imaplib.IMAP4.abort, imaplib.IMAP4.error, OSError) as e:
+                logger.warning(f"Ошибка батч-фетча Message-ID: {e}")
+                continue
+            for item in data:
+                if isinstance(item, tuple) and len(item) >= 2 and item[1]:
+                    try:
+                        seq = item[0].split(b' ', 1)[0]
+                        mid = email.message_from_bytes(item[1]).get('Message-ID')
+                        if mid:
+                            result[seq] = mid.strip()
+                    except Exception:
+                        pass
+        return result
 
     async def _fetch_email(self, msg_id: bytes) -> Optional[Dict]:
         try:

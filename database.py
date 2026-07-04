@@ -48,8 +48,16 @@ class EmailDatabase:
             logger.error(f"Ошибка инициализации базы данных: {e}")
     
     def get_email_hash(self, email_data: dict) -> str:
-        """Создает уникальный хеш для письма"""
-        hash_string = f"{email_data.get('sender', '')}{email_data.get('subject', '')}{email_data.get('message_id', '')}"
+        """Ключ дедупликации письма.
+
+        Message-ID уникален и стабилен между проверками — используем его напрямую,
+        чтобы дедуп не зависел от объёма писем (в отличие от старого deque(maxlen=1000)).
+        Fallback на md5(sender+subject) только для писем без Message-ID.
+        """
+        message_id = (email_data.get('message_id') or '').strip()
+        if message_id:
+            return message_id
+        hash_string = f"{email_data.get('sender', '')}{email_data.get('subject', '')}"
         return hashlib.md5(hash_string.encode()).hexdigest()
     
     def is_email_sent(self, email_data: dict) -> bool:
