@@ -68,8 +68,16 @@ class EmailClient:
 
     async def get_new_emails(self, since: Optional[datetime] = None, is_sent=None) -> List[Dict]:
         if not self.is_connected:
-            logger.error("Нет подключения к почтовому серверу")
-            return []
+            # Самовосстановление: пробуем переподключиться на каждом цикле.
+            # Иначе после неудачного reconnect (например, временный
+            # "Too many simultaneous connections" от Gmail) is_connected
+            # остаётся False и бот навсегда глохнет к почте.
+            logger.warning("Нет подключения к почтовому серверу. Пробую переподключиться...")
+            try:
+                await self.connect()
+            except Exception as e:
+                logger.error(f"Переподключение не удалось: {e}")
+                return []
 
         try:
             loop = asyncio.get_event_loop()
