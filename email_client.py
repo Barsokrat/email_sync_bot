@@ -9,6 +9,13 @@ import ssl
 
 logger = logging.getLogger(__name__)
 
+# Socket-таймаут на IMAP-операции. Без него зависшее чтение (half-open TCP,
+# когда Gmail молча роняет соединение) блокирует поток НАВСЕГДА: процесс жив,
+# systemd видит active, но опрос почты встал (инцидент 2026-07-11 — бот 3 дня
+# молча не пересылал регистрации). С таймаутом зависание превращается в
+# socket.timeout (подкласс OSError) и ловится обработчиками reconnect ниже.
+IMAP_TIMEOUT = 60
+
 class EmailClient:
     def __init__(self, config):
         self.config = config
@@ -25,7 +32,7 @@ class EmailClient:
             # Подключаемся к IMAP серверу в отдельном потоке
             self.imap = await loop.run_in_executor(
                 None,
-                lambda: imaplib.IMAP4_SSL(self.config.email_server, self.config.email_port, ssl_context=context)
+                lambda: imaplib.IMAP4_SSL(self.config.email_server, self.config.email_port, ssl_context=context, timeout=IMAP_TIMEOUT)
             )
 
             # Авторизуемся
